@@ -1,48 +1,48 @@
 import torch
 import torch.nn as nn
-
 from .multihead_attention import MultiHeadAttention
-from .feedforward import FeedForward
+from .moe import MoEFeedForward
 from .norm import LayerNorm
 
 class DecoderBlock(nn.Module):
-
-    def __init__(self, model_dim, n_heads, context_length, ff_dim, 
-                 dropout_rate=0.1):
+    """
+    Pre-LN Transformer Decoder Block with Mixture of Experts (MoE).
+    """
+    def __init__(self, model_dim, n_heads, context_length, ff_dim,
+                 num_experts=5, top_k=2, dropout_rate=0.1):
         super().__init__()
-
-        # Mask Self-Attention
-        self.self_attention = MultiHeadAttention(model_dim, n_heads, context_length, 
-                                                 dropout_rate, mask=True)
+        # Causal Self-Attention
         self.norm_1 = LayerNorm(model_dim)
+        self.self_attention = MultiHeadAttention(model_dim, n_heads, context_length,
+                                                 dropout_rate=dropout_rate, is_causal=True)
         self.dropout_1 = nn.Dropout(dropout_rate)
 
-        # Cross-Attention
-        self.cross_attention = MultiHeadAttention(model_dim, n_heads, context_length, 
-                                                  dropout_rate)
+        # Cross-Attention to Encoder output
         self.norm_2 = LayerNorm(model_dim)
+        self.cross_attention = MultiHeadAttention(model_dim, n_heads, context_length,
+                                                  dropout_rate=dropout_rate, is_causal=False)
         self.dropout_2 = nn.Dropout(dropout_rate)
 
-        # Feed Forward
-        self.feedforward = FeedForward(model_dim, ff_dim, 
-                                       dropout_rate)
+        # MoE Feed-Forward
         self.norm_3 = LayerNorm(model_dim)
+        self.moe = MoEFeedForward(model_dim, ff_dim, num_experts=num_experts,
+                                  top_k=top_k, dropout_rate=dropout_rate)
         self.dropout_3 = nn.Dropout(dropout_rate)
 
-    def forward(self, X_encoder, X_decoder):
-        attn = self.self_attention(X_decoder) # Self-Attention
-        attn = self.dropout_1(attn) # Dropout
-        X_decoder = X_decoder + attn # Residual connection
-        X_decoder = self.norm_1(X_decoder) # Norm Layer
+    def forward(self, x_decoder, x_encoder, tar_mask=None, src_mask=None):
+        # 1. Pre-LN Causal Self-Attention
+        normed_dec = self.norm_1(x_decoder)
+        self_attn = self.self_attention(normed_dec, normed_dec, normed_dec, key_padding_mask=tar_mask)
+        x_decoder = x_decoder + self.dropout_1(self_attn)
 
-        attn = self.cross_attention(X_decoder, X_encoder, X_encoder) # Cross-Attention
-        attn = self.dropout_2(attn) # Dropout
-        X_decoder = X_decoder + attn # Residual connection
-        X_decoder = self.norm_2(X_decoder) # Norm Layer
+        # 2. Pre-LN Cross-Attention
+        normed_cross = self.norm_2(x_decoder)
+        cross_attn = self.cross_attention(normed_cross, x_encoder, x_encoder, key_padding_mask=src_mask)
+        x_decoder = x_decoder + self.dropout_2(cross_attn)
 
-        ff = self.feedforward(X_decoder) # Feed Forward
-        ff = self.dropout_3(ff) # Dropout
-        X_decoder = X_decoder + ff # Residual connection
-        X_decoder = self.norm_3(X_decoder) # Norm Layer
+        # 3. Pre-LN MoE Feed-Forward
+        normed_moe = self.norm_3(x_decoder)
+        moe_out, aux_loss = self.moe(normed_moe)
+        x_decoder = x_decoder + self.dropout_3(moe_out)
 
-        return X_decoder
+        return x_decoder, aux_loss

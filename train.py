@@ -1,141 +1,330 @@
 import torch
-
-from time import time
+from torch.cuda.amp import autocast, GradScaler
+from time import time, strftime, localtime
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import glob
+import re
+import math
+from tqdm import tqdm
 
-from configs.config import Config
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
+from configs import Config
 from src.utils import Logger, calc_loss_batch, calc_loss_loader
 from src.dataset import get_dataloader
 from model.transformer_model import TransformerModel
 
-def training_model(model, train_loader, val_loader,
-                   optimizer, scheduler, device, epochs, 
-                   start_epoch, start_step, best_val_loss,
-                   eval_freq, save_path, log):
-    train_losses = []
-    val_losses = []
+def log_batch_results_to_txt(file_path, epoch, total_epochs, batch_idx, total_batches,
+                             step, train_loss, ce_loss, aux_loss, lr, elapsed_s):
+    """
+    Appends training results to a formatted text file every several batches.
+    """
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    ts = strftime("%Y-%m-%d %H:%M:%S", localtime())
+    pct = (batch_idx / total_batches) * 100.0
+    line = (
+        f"[{ts}] Epoch {epoch}/{total_epochs} | "
+        f"Batch {batch_idx:06d}/{total_batches:06d} ({pct:5.1f}%) | "
+        f"Step {step:07d} | "
+        f"Loss: {train_loss:7.4f} | "
+        f"CE_Loss: {ce_loss:7.4f} | "
+        f"MoE_Aux: {aux_loss:6.4f} | "
+        f"LR: {lr:9.7f} | "
+        f"Time: {elapsed_s:6.1f}s"
+    )
+    with open(file_path, 'a', encoding='utf-8') as f:
+        f.write(line + "\n")
+
+def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, step, best_val_loss, log):
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'scaler_state_dict': scaler.state_dict() if scaler else None,
+        'epoch': epoch,
+        'step': step,
+        'best_val_loss': best_val_loss,
+        'config': {
+            'vocab_size': Config.VOCAB_SIZE,
+            'model_dim': Config.MODEL_DIM,
+            'n_heads': Config.N_HEADS,
+            'context_length': Config.CONTEXT_LENGTH,
+            'ff_dim': Config.FF_DIM,
+            'n_encoders': Config.N_ENCODERS,
+            'n_decoders': Config.N_DECODERS,
+            'num_experts': Config.NUM_EXPERTS,
+            'top_k': Config.TOP_K_EXPERTS,
+        }
+    }
+    torch.save(checkpoint, path)
+    log.print(f"  >>> Checkpoint saved to: {path}")
+
+def find_latest_checkpoint():
+    """
+    Finds the most recent checkpoint file for automatic resume.
+    """
+    if os.path.exists(Config.CHECKPOINT_LATEST):
+        return Config.CHECKPOINT_LATEST
+    if os.path.exists(Config.CHECKPOINT_BEST):
+        return Config.CHECKPOINT_BEST
+
+    # Check for any model_epoch_* files in checkpoints directory
+    pattern = os.path.join(Config.CHECKPOINT_DIR, "model_epoch_*.pt")
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    # Sort files by modification time (most recent first)
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[0]
+
+def train_model(model, train_loader, val_loader, optimizer, scheduler, scaler,
+                device, epochs, start_epoch, start_step, best_val_loss,
+                eval_freq, log):
+    os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+    total_batches = len(train_loader)
     step = start_step
+
+    # Header for training results text file
+    if not os.path.exists(Config.TRAINING_RESULTS_TXT):
+        with open(Config.TRAINING_RESULTS_TXT, 'w', encoding='utf-8') as f:
+            f.write("=" * 115 + "\n")
+            f.write(f"150M MoE Transformer Training Log (5 Experts, Top-2 Routing)\n")
+            f.write(f"Initialized at: {strftime('%Y-%m-%d %H:%M:%S', localtime())}\n")
+            f.write("=" * 115 + "\n")
+
+    # Milestone batches for 25%, 50%, 75%, 100% of epoch
+    milestones = {
+        max(1, int(0.25 * total_batches)): "25pct",
+        max(1, int(0.50 * total_batches)): "50pct",
+        max(1, int(0.75 * total_batches)): "75pct",
+        total_batches: "100pct"
+    }
+    log.print(f"Epoch milestones (batches): {milestones}")
+    log.print(f"Results recorded every {Config.LOG_FREQ_BATCHES} batches to: {Config.TRAINING_RESULTS_TXT}")
 
     for epoch in range(start_epoch, epochs):
         model.train()
-        
-        start_time = time()
-        for src_batch, tar_batch in train_loader:
-            optimizer.zero_grad()
-            loss = calc_loss_batch(model, src_batch, tar_batch, device)
-            loss.backward()
+        epoch_start_time = time()
+        running_loss = 0.0
+        running_ce = 0.0
+        running_aux = 0.0
+        batch_count = 0
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}")
+        optimizer.zero_grad(set_to_none=True)
 
-            optimizer.step()
-            scheduler.step()
+        for batch_idx, (src_batch, tar_batch) in enumerate(pbar, start=1):
+            with autocast(dtype=Config.DTYPE):
+                loss, ce_loss, aux_loss = calc_loss_batch(
+                    model, src_batch, tar_batch, device,
+                    aux_loss_coef=Config.AUX_LOSS_COEF,
+                    label_smoothing=Config.LABEL_SMOOTHING
+                )
+                loss = loss / Config.GRAD_ACCUM_STEPS
 
-            step += 1
-            if step % eval_freq == 0:
-                model.eval()
-                with torch.inference_mode():
-                    train_loss = calc_loss_loader(train_loader, model, device, num_batches=5)
-                    val_loss = calc_loss_loader(val_loader, model, device)
+            scaler.scale(loss).backward()
 
-                    train_losses.append(train_loss)
-                    val_losses.append(val_loss)
+            running_loss += loss.item() * Config.GRAD_ACCUM_STEPS
+            running_ce += ce_loss.item()
+            running_aux += aux_loss.item()
+            batch_count += 1
 
-                    elapsed = time() - start_time
-                    log.print(f"Ep {epoch + 1} (Step {step:07d}) | Train loss {train_loss:.5f} | Val loss {val_loss:.5f} | Time {elapsed:.2f}s")
+            if batch_idx % Config.GRAD_ACCUM_STEPS == 0 or batch_idx == total_batches:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.MAX_GRAD_NORM)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler:
+                    scheduler.step()
+                step += 1
+
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{running_loss / batch_count:.4f}",
+                'ce': f"{running_ce / batch_count:.4f}",
+                'aux': f"{running_aux / batch_count:.2f}"
+            })
+
+            # Requirement: Write results to txt file every several batches
+            if batch_idx % Config.LOG_FREQ_BATCHES == 0 or batch_idx == total_batches:
+                elapsed_s = time() - epoch_start_time
+                current_lr = optimizer.param_groups[0]['lr']
+                log_batch_results_to_txt(
+                    file_path=Config.TRAINING_RESULTS_TXT,
+                    epoch=epoch + 1,
+                    total_epochs=epochs,
+                    batch_idx=batch_idx,
+                    total_batches=total_batches,
+                    step=step,
+                    train_loss=running_loss / batch_count,
+                    ce_loss=running_ce / batch_count,
+                    aux_loss=running_aux / batch_count,
+                    lr=current_lr,
+                    elapsed_s=elapsed_s
+                )
+
+            # Checkpoint at 25%, 50%, 75%, and 100% of epoch
+            if batch_idx in milestones:
+                pct_tag = milestones[batch_idx]
+                log.print(f"\n[Milestone reached: Epoch {epoch + 1} - {pct_tag} ({batch_idx}/{total_batches} batches)]")
                 
+                # Validation evaluation at milestone
+                val_loss, val_ce = calc_loss_loader(val_loader, model, device, num_batches=15, aux_loss_coef=Config.AUX_LOSS_COEF)
+                log.print(f"  Milestone Eval -> Val Loss: {val_loss:.4f} | Val CE: {val_ce:.4f}")
+
+                # Log milestone in text file
+                with open(Config.TRAINING_RESULTS_TXT, 'a', encoding='utf-8') as f:
+                    f.write(f"--- MILESTONE: Epoch {epoch + 1} ({pct_tag}) | Val Loss: {val_loss:.4f} | Val CE: {val_ce:.4f} ---\n")
+
+                # 1. Save epoch milestone checkpoint
+                milestone_ckpt_path = os.path.join(
+                    Config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}_{pct_tag}.pt"
+                )
+                # Next resume point is epoch if 100pct finished, else current epoch
+                save_epoch_idx = (epoch + 1) if pct_tag == "100pct" else epoch
+                save_checkpoint(milestone_ckpt_path, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
+
+                # 2. Check and save best model
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    checkpoint = {
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'step': step,
-                        'epoch': epoch,
-                        'best_val_loss': best_val_loss # Lưu kèm để khi resume không bị reset
-                    }
-                    torch.save(checkpoint, save_path)
-                    log.print(f"--- Model saved (Best loss: {best_val_loss:.5f}) ---")
+                    save_checkpoint(Config.CHECKPOINT_BEST, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
+                    log.print(f"  ★ NEW BEST MODEL SAVED! (Val loss: {best_val_loss:.4f})")
 
-                start_time = time()
+                # 3. Update latest checkpoint
+                save_checkpoint(Config.CHECKPOINT_LATEST, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
                 model.train()
 
+            # Periodic logging
+            if step > 0 and step % eval_freq == 0 and batch_idx % Config.GRAD_ACCUM_STEPS == 0:
+                val_loss, val_ce = calc_loss_loader(val_loader, model, device, num_batches=10, aux_loss_coef=Config.AUX_LOSS_COEF)
+                elapsed = time() - epoch_start_time
+                current_lr = optimizer.param_groups[0]['lr']
+                log.print(f"Step {step:07d} (Ep {epoch+1} {batch_idx}/{total_batches}) | Train: {running_loss/batch_count:.4f} | Val: {val_loss:.4f} | LR: {current_lr:.6f} | Time: {elapsed:.1f}s")
+                save_checkpoint(Config.CHECKPOINT_LATEST, model, optimizer, scheduler, scaler, epoch, step, best_val_loss, log)
+                model.train()
+
+        epoch_time = time() - epoch_start_time
+        log.print(f"\n=======================================================")
+        log.print(f"Completed Epoch {epoch + 1}/{epochs} in {epoch_time:.2f}s | Avg Train Loss: {running_loss / batch_count:.4f}")
+        log.print(f"=======================================================\n")
+
+        # Save 100% completion checkpoint and advance epoch index
+        save_checkpoint(os.path.join(Config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}_100pct.pt"),
+                        model, optimizer, scheduler, scaler, epoch + 1, step, best_val_loss, log)
+        save_checkpoint(Config.CHECKPOINT_LATEST, model, optimizer, scheduler, scaler, epoch + 1, step, best_val_loss, log)
+
 if __name__ == '__main__':
-    # READ AND LOAD DATA
     train_path = f'{Config.PROCESSED_DATA_PATH}train_ids.parquet'
     val_path = f'{Config.PROCESSED_DATA_PATH}val_ids.parquet'
 
-    train_loader = get_dataloader(train_path, Config)
-    val_loader = get_dataloader(val_path, Config)
+    train_loader = get_dataloader(train_path, Config, shuffle=True, is_train=True)
+    val_loader = get_dataloader(val_path, Config, shuffle=False, is_train=False)
 
-    print(f'len train data loader: {len(train_loader)}, len val data loader: {len(val_loader)}')
-
-    # Definition
     logger = Logger(Config.CHECKPOINT_LOG)
-    model = TransformerModel(Config.VOCAB_SIZE, 
-                             Config.MODEL_DIM, 
-                             Config.N_HEADS,
-                             Config.CONTEXT_LENGTH, 
-                             Config.FF_DIM,
-                             Config.N_ENCODERS, 
-                             Config.N_DECODERS,
-                             dropout_rate=Config.DROPOUT_RATE, 
-                             device=Config.DEVICE)
-    
+    logger.print("=" * 65)
+    logger.print("  150M MoE Transformer (5 Experts, Top-2 Routing) Training")
+    logger.print("=" * 65)
+
+    model = TransformerModel(
+        vocab_size=Config.VOCAB_SIZE,
+        model_dim=Config.MODEL_DIM,
+        n_heads=Config.N_HEADS,
+        context_length=Config.CONTEXT_LENGTH,
+        ff_dim=Config.FF_DIM,
+        n_encoders=Config.N_ENCODERS,
+        n_decoders=Config.N_DECODERS,
+        num_experts=Config.NUM_EXPERTS,
+        top_k=Config.TOP_K_EXPERTS,
+        dropout_rate=Config.DROPOUT_RATE,
+        pad_id=0,
+        tie_embeddings=Config.TIE_EMBEDDINGS,
+        device=Config.DEVICE
+    ).to(Config.DEVICE)
+
+    total_params, trainable_params = model.count_parameters()
+    logger.print(f"Model Parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
+    logger.print(f"Trainable Parameters: {trainable_params:,}")
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=Config.LEARNING_RATE,
         betas=(0.9, 0.98),
-        eps=1e-9,
-        weight_decay=Config.WEIGHT_DECAY,
-        foreach=False
+        eps=1e-8,
+        weight_decay=Config.WEIGHT_DECAY
     )
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: min(
-            (step + 1) ** -0.5,
-            (step + 1) * (Config.WARMUP_STEP ** -1.5)
-        )
-    )
+    total_steps = (len(train_loader) // Config.GRAD_ACCUM_STEPS) * max(1, Config.EPOCHS)
+
+    # Cosine learning rate schedule with linear warmup
+    def lr_lambda(current_step):
+        if current_step < Config.WARMUP_STEPS:
+            return float(current_step) / float(max(1, Config.WARMUP_STEPS))
+        progress = float(current_step - Config.WARMUP_STEPS) / float(max(1, total_steps - Config.WARMUP_STEPS))
+        return max(Config.MIN_LEARNING_RATE / Config.LEARNING_RATE, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler = GradScaler(enabled=(Config.DTYPE == torch.float16))
 
     start_step = 0
     start_epoch = 0
     best_val_loss = float('inf')
-    if os.path.exists(Config.CHECKPOINT_MODEL):
-        checkpoint = torch.load(Config.CHECKPOINT_MODEL, map_location=Config.DEVICE)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device=Config.DEVICE, dtype=Config.DTYPE)
+    # Automatic Autoload of Previous Epoch Checkpoints
+    latest_ckpt_path = find_latest_checkpoint()
+    if latest_ckpt_path and os.path.exists(latest_ckpt_path):
+        logger.print(f"Autoloading previous checkpoint from: {latest_ckpt_path}")
+        ckpt = torch.load(latest_ckpt_path, map_location=Config.DEVICE)
+        model.load_state_dict(ckpt['model_state_dict'])
+        if 'optimizer_state_dict' in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            except Exception as e:
+                logger.print(f"Warning loading optimizer state: {e}")
+        if 'scheduler_state_dict' in ckpt and ckpt['scheduler_state_dict']:
+            try:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            except Exception as e:
+                logger.print(f"Warning loading scheduler state: {e}")
+        if 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict']:
+            try:
+                scaler.load_state_dict(ckpt['scaler_state_dict'])
+            except Exception as e:
+                logger.print(f"Warning loading scaler state: {e}")
 
-        start_step = checkpoint.get('step', 0)
-        start_epoch = checkpoint.get('epoch', -1) + 1
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        print(f'Resumed from step {start_step}')
+        start_step = ckpt.get('step', 0)
+        start_epoch = ckpt.get('epoch', 0)
+        best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        logger.print(f"[✓] Successfully autoloaded: Resumed from Epoch {start_epoch + 1}, Step {start_step}, Best Val Loss: {best_val_loss:.4f}")
     else:
-        print('Start training model')
-    
-    model = model.to(device=Config.DEVICE, dtype=Config.DTYPE)
-    
-    total_params = sum(param.numel() for param in model.parameters())
-    print(f'total number of parameters: {total_params}')
+        logger.print("No previous checkpoint found. Starting training from scratch (Epoch 1).")
 
-    training_model(model=model,
-                   train_loader=train_loader, 
-                   val_loader=val_loader, 
-                   optimizer=optimizer, 
-                   scheduler=scheduler, 
-                   device=Config.DEVICE,
-                   epochs=Config.EPOCHS,
-                   start_step=start_step,
-                   start_epoch=start_epoch,
-                   best_val_loss=best_val_loss,
-                   eval_freq=Config.EVAL_FREQ, 
-                   save_path=Config.CHECKPOINT_MODEL, 
-                   log=logger)
+    # Check if requested epochs are already completed
+    if start_epoch >= Config.EPOCHS:
+        logger.print("\n" + "=" * 65)
+        logger.print(f"[INFO] Model has already completed {start_epoch} epoch(s).")
+        logger.print(f"Current Config.EPOCHS is set to {Config.EPOCHS}.")
+        logger.print(f"To continue training further:")
+        logger.print(f"  1. Open configs/config.py")
+        logger.print(f"  2. Increase EPOCHS (e.g. EPOCHS = {start_epoch + 1})")
+        logger.print(f"  3. Re-run 'python train.py'")
+        logger.print("The model will automatically autoload the parameters from epoch "
+                     f"{start_epoch} and continue training.")
+        logger.print("=" * 65)
+    else:
+        logger.print(f"Training will run from Epoch {start_epoch + 1} to Epoch {Config.EPOCHS}...")
+        train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            device=Config.DEVICE,
+            epochs=Config.EPOCHS,
+            start_epoch=start_epoch,
+            start_step=start_step,
+            best_val_loss=best_val_loss,
+            eval_freq=Config.EVAL_FREQ_STEPS,
+            log=logger
+        )

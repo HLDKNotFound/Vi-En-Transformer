@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data directories (raw & processed parquet files)
+data/
+data/raw/
+data/processed/
+data/raw_tmp/
+*.parquet
+
+# Model checkpoints & weights (large binaries)
+checkpoints/*.pt
+checkpoints/*.bin
+*.pt
+
+# Keep logs if desired, but ignore binary checkpoints
+!checkpoints/*.txt
+
+# Temporary test files & caches
+tokenizer/test_vocab.json
+benchmark_results.json
+.ipynb_checkpoints/
+*.log
+
+# Environment & IDE
+.env
+.venv/
+env/
+venv/
+.vscode/
+.idea/
+.DS_Store

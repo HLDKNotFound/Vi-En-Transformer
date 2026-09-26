@@ -1,94 +1,74 @@
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 import math
 
 class MultiHeadAttention(nn.Module):
-    
-    def __init__(self, model_dim, n_heads, context_length, 
-                 dropout_rate=0.1, mask=False):
+    """
+    Multi-Head Attention supporting key padding mask and causal mask.
+    """
+    def __init__(self, model_dim, n_heads, context_length=256, dropout_rate=0.1, is_causal=False):
         super().__init__()
-
-        assert model_dim % n_heads == 0, f'model_dim {model_dim} must be divided by n_heads {n_heads}'
+        assert model_dim % n_heads == 0, f"model_dim {model_dim} must be divisible by n_heads {n_heads}"
 
         self.model_dim = model_dim
         self.n_heads = n_heads
         self.head_dim = model_dim // n_heads
-        self.scale = math.sqrt(self.head_dim)
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.is_causal = is_causal
 
-        self.W_query = nn.Linear(model_dim, model_dim, 
-                                 bias=False)
-        # Query Weight
-        self.W_key = nn.Linear(model_dim, model_dim, 
-                               bias=False)
-        # Key Weight
-        self.W_value = nn.Linear(model_dim, model_dim, 
-                                 bias=False)
-        # Value Weight
+        self.W_query = nn.Linear(model_dim, model_dim, bias=False)
+        self.W_key = nn.Linear(model_dim, model_dim, bias=False)
+        self.W_value = nn.Linear(model_dim, model_dim, bias=False)
+        self.W_out = nn.Linear(model_dim, model_dim, bias=False)
 
-        self.W_out = nn.Linear(model_dim, model_dim, 
-                               bias=False)
-        # Output Projection
-        
         self.dropout = nn.Dropout(dropout_rate)
-        if mask:
-            causal_mask = torch.triu(
-                torch.ones(context_length, context_length),
-                diagonal=1
-            ).bool()
-            self.register_buffer('causal_mask', causal_mask)
+
+        if is_causal:
+            causal_mask = torch.triu(torch.ones(context_length, context_length, dtype=torch.bool), diagonal=1)
+            self.register_buffer("causal_mask", causal_mask)
         else:
             self.causal_mask = None
-        # Casual mask
 
-    def forward(self, X_query, X_key=None, X_value=None):
-        if X_key is None or X_value is None:
-            X_key = X_query
-            X_value = X_query
+    def forward(self, q, k=None, v=None, key_padding_mask=None):
+        """
+        q: (batch, seq_len_q, model_dim)
+        k: (batch, seq_len_kv, model_dim)
+        v: (batch, seq_len_kv, model_dim)
+        key_padding_mask: (batch, seq_len_kv) boolean mask, True where pad
+        """
+        if k is None or v is None:
+            k = q
+            v = q
 
-        batch_size, n_tokens_q = X_query.shape[:2]
-        n_tokens_kv = X_key.shape[1]
+        batch_size, n_tokens_q, _ = q.shape
+        n_tokens_kv = k.shape[1]
 
-        queries = self.W_query(X_query) 
-        # (batch_size, model_dim, model_dim)
-        queries = queries.view(batch_size, n_tokens_q, self.n_heads, self.head_dim) 
-        # (batch_size, n_tokens, n_heads, head_dim)
-        queries = queries.transpose(1, 2) 
-        # (batch_size, n_heads, n_tokens, head_dim)
+        # Project and reshape: (batch, n_heads, seq_len, head_dim)
+        Q = self.W_query(q).view(batch_size, n_tokens_q, self.n_heads, self.head_dim).transpose(1, 2)
+        K = self.W_key(k).view(batch_size, n_tokens_kv, self.n_heads, self.head_dim).transpose(1, 2)
+        V = self.W_value(v).view(batch_size, n_tokens_kv, self.n_heads, self.head_dim).transpose(1, 2)
 
-        keys = self.W_key(X_key) 
-        # (batch_size, model_dim, model_dim)
-        keys = keys.view(batch_size, n_tokens_kv, self.n_heads, self.head_dim) 
-        # (batch_size, n_tokens, n_heads, head_dim)
-        keys = keys.transpose(1, 2) 
-        # (batch_size, n_tokens, n_heads, head_dim)
+        # Scaled dot-product attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (batch, n_heads, n_q, n_kv)
 
-        values = self.W_value(X_value) 
-        # (batch_size, model_dim, model_dim)
-        values = values.view(batch_size, n_tokens_kv, self.n_heads, self.head_dim) 
-        # (batch_size, n_tokens, n_heads, head_dim)
-        values = values.transpose(1, 2) 
-        # (batch_size, n_tokens, n_heads, head_dim)
+        # Apply causal mask
+        if self.is_causal and self.causal_mask is not None:
+            c_mask = self.causal_mask[:n_tokens_q, :n_tokens_kv]
+            scores = scores.masked_fill(c_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
 
-        attn_scores = queries @ keys.transpose(2, 3)
-        # (batch_size, n_heads, n_tokens, n_tokens) 
-        # = (batch_size, n_heads, n_tokens, head_dim) @ (batch_size, n_heads, head_dim, n_tokens)
-        if self.causal_mask is not None:
-            cur_mask = self.causal_mask[:n_tokens_q, :n_tokens_kv]
-            attn_scores = attn_scores.masked_fill(
-                cur_mask,
-                float('-inf')
-            )
-        attn_weights = torch.softmax(attn_scores / self.scale, dim=-1) 
-        # (batch_size, n_heads, n_tokens, n_tokens)
-        attn_weights = self.dropout(attn_weights) 
-        # (batch_size, n_heads, n_tokens, n_tokens) 
+        # Apply key padding mask
+        if key_padding_mask is not None:
+            # key_padding_mask shape: (batch, n_tokens_kv), expand to (batch, 1, 1, n_tokens_kv)
+            pad_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(pad_mask, float('-inf'))
 
-        context_vec = (attn_weights @ values).transpose(1, 2)
-        # (batch_size, n_heads, n_tokens, head_dim) 
-        # = (batch_size, n_heads, n_tokens, n_tokens) @ (batch_size, n_tokens, n_tokens, head_dim)
-        # => (batch_size, n_tokens, n_heads, head_dim)
-        context_vec = context_vec.contiguous().view(batch_size, n_tokens_q, self.model_dim)
-        # (batch_size, n_tokens, model_dim)
+        attn_weights = F.softmax(scores, dim=-1)
+        # In case all keys were masked, avoid NaN by zeroing out
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+        attn_weights = self.dropout(attn_weights)
 
-        return self.W_out(context_vec) # (batch_size, n_token, model_dim)
+        context = torch.matmul(attn_weights, V)  # (batch, n_heads, n_q, head_dim)
+        context = context.transpose(1, 2).contiguous().view(batch_size, n_tokens_q, self.model_dim)
+
+        return self.W_out(context)

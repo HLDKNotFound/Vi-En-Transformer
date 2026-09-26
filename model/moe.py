@@ -18,10 +18,11 @@ class Expert(nn.Module):
 
 class MoEFeedForward(nn.Module):
     """
-    Mixture of Experts (MoE) Feed-Forward layer.
+    Optimized Mixture of Experts (MoE) Feed-Forward layer.
     - num_experts: 5 experts
     - top_k: 2 experts selected per token (both training and inference)
-    - Load balancing auxiliary loss (Switch/GShard formulation) to prevent expert collapse
+    - Load balancing auxiliary loss (Switch/GShard formulation)
+    - Optimized single-pass per expert dispatch
     """
     def __init__(self, model_dim, ff_dim, num_experts=5, top_k=2, dropout_rate=0.1):
         super().__init__()
@@ -69,16 +70,18 @@ class MoEFeedForward(nn.Module):
         # Switch Transformer / GShard load balancing loss
         aux_loss = self.num_experts * torch.sum(f_e * P_e)
 
-        # Dispatch tokens to selected experts
+        # Optimized Single-Pass Dispatch per expert (5 passes instead of 10)
         out_flat = torch.zeros_like(x_flat)
-        for e_idx in range(self.num_experts):
-            for k in range(self.top_k):
-                mask = (topk_indices[:, k] == e_idx)
-                if mask.any():
-                    tokens_for_expert = x_flat[mask]
-                    expert_out = self.experts[e_idx](tokens_for_expert)
-                    weight = topk_weights[mask, k].unsqueeze(-1)
-                    out_flat[mask] += expert_out * weight
+        for e_idx, expert in enumerate(self.experts):
+            mask0 = (topk_indices[:, 0] == e_idx)
+            mask1 = (topk_indices[:, 1] == e_idx)
+            mask = mask0 | mask1
+            if mask.any():
+                tokens_for_expert = x_flat[mask]
+                expert_out = expert(tokens_for_expert)
+                # Weights: topk_weights[:, 0] if slot 0, else topk_weights[:, 1]
+                w = torch.where(mask0[mask], topk_weights[mask, 0], topk_weights[mask, 1]).unsqueeze(-1)
+                out_flat[mask] += expert_out * w
 
         out = self.dropout(out_flat.view(orig_shape))
         return out, aux_loss

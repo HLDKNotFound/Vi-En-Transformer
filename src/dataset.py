@@ -17,10 +17,27 @@ class MultiTaskTranslationDataset(Dataset):
     3. <sos> <vi> {vi} <eos> -> <sos> <vi> {vi} <eos> (VI -> VI autoencoding)
     4. <sos> <en> {en} <eos> -> <sos> <en> {en} <eos> (EN -> EN autoencoding)
     """
-    def __init__(self, file_path, tokenizer_path, context_length=256, is_train=True, task_weights=(0.35, 0.35, 0.15, 0.15)):
+    def __init__(self, file_path, tokenizer_path, context_length=256, is_train=True,
+                 max_samples=None, epoch_offset=0, task_weights=(0.35, 0.35, 0.15, 0.15)):
         df = pd.read_parquet(file_path)
-        self.vi_data = df['vi_ids'].tolist()
-        self.en_data = df['en_ids'].tolist()
+        all_vi = df['vi_ids'].tolist()
+        all_en = df['en_ids'].tolist()
+
+        if max_samples and max_samples < len(all_vi):
+            # Select slice for current epoch so each epoch sees fresh data
+            total = len(all_vi)
+            start_i = (epoch_offset * max_samples) % total
+            end_i = start_i + max_samples
+            if end_i <= total:
+                self.vi_data = all_vi[start_i:end_i]
+                self.en_data = all_en[start_i:end_i]
+            else:
+                self.vi_data = all_vi[start_i:] + all_vi[:end_i - total]
+                self.en_data = all_en[start_i:] + all_en[:end_i - total]
+        else:
+            self.vi_data = all_vi
+            self.en_data = all_en
+
         self.context_length = context_length
         self.is_train = is_train
         self.task_weights = task_weights
@@ -40,13 +57,10 @@ class MultiTaskTranslationDataset(Dataset):
         en_tokens = self.en_data[idx]
 
         if self.is_train:
-            # Randomly select one of the 4 tasks
             task = random.choices([0, 1, 2, 3], weights=self.task_weights, k=1)[0]
         else:
-            # Deterministic for validation: alternate between tasks
             task = idx % 4
 
-        # Max allowed content tokens to leave space for <sos>, <lang>, and <eos>
         max_content = self.context_length - 3
 
         if task == 0:
@@ -79,20 +93,24 @@ def collate_fn(batch, pad_id=0):
 
     return src_padded, tar_padded
 
-def get_dataloader(file_path, config, shuffle=True, is_train=True):
+def get_dataloader(file_path, config, shuffle=True, is_train=True, epoch=0):
     tok_path = config.TOKENIZER_JSON if os.path.exists(config.TOKENIZER_JSON) else config.TOKENIZER_PATH
+    max_samples = config.MAX_TRAIN_SAMPLES_PER_EPOCH if is_train else None
     dataset = MultiTaskTranslationDataset(
         file_path,
         tok_path,
         context_length=config.CONTEXT_LENGTH,
-        is_train=is_train
+        is_train=is_train,
+        max_samples=max_samples,
+        epoch_offset=epoch
     )
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=shuffle,
-        num_workers=2,
+        num_workers=4,
         pin_memory=True,
+        persistent_workers=True,
         collate_fn=lambda x: collate_fn(x, dataset.pad_id)
     )
     return dataloader

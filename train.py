@@ -4,7 +4,6 @@ from time import time, strftime, localtime
 import sys
 import os
 import glob
-import re
 import math
 from tqdm import tqdm
 
@@ -68,42 +67,43 @@ def find_latest_checkpoint():
     if os.path.exists(Config.CHECKPOINT_BEST):
         return Config.CHECKPOINT_BEST
 
-    # Check for any model_epoch_* files in checkpoints directory
     pattern = os.path.join(Config.CHECKPOINT_DIR, "model_epoch_*.pt")
     files = glob.glob(pattern)
     if not files:
         return None
-    # Sort files by modification time (most recent first)
     files.sort(key=os.path.getmtime, reverse=True)
     return files[0]
 
-def train_model(model, train_loader, val_loader, optimizer, scheduler, scaler,
+def train_model(model, train_path, val_loader, optimizer, scheduler, scaler,
                 device, epochs, start_epoch, start_step, best_val_loss,
                 eval_freq, log):
     os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
-    total_batches = len(train_loader)
     step = start_step
 
     # Header for training results text file
     if not os.path.exists(Config.TRAINING_RESULTS_TXT):
         with open(Config.TRAINING_RESULTS_TXT, 'w', encoding='utf-8') as f:
             f.write("=" * 115 + "\n")
-            f.write(f"150M MoE Transformer Training Log (5 Experts, Top-2 Routing)\n")
+            f.write(f"150M MoE Transformer Accelerated Training Log (5 Experts, Top-2 Routing)\n")
             f.write(f"Initialized at: {strftime('%Y-%m-%d %H:%M:%S', localtime())}\n")
             f.write("=" * 115 + "\n")
 
-    # Milestone batches for 25%, 50%, 75%, 100% of epoch
-    milestones = {
-        max(1, int(0.25 * total_batches)): "25pct",
-        max(1, int(0.50 * total_batches)): "50pct",
-        max(1, int(0.75 * total_batches)): "75pct",
-        total_batches: "100pct"
-    }
-    log.print(f"Epoch milestones (batches): {milestones}")
-    log.print(f"Results recorded every {Config.LOG_FREQ_BATCHES} batches to: {Config.TRAINING_RESULTS_TXT}")
-
     for epoch in range(start_epoch, epochs):
         model.train()
+        train_loader = get_dataloader(train_path, Config, shuffle=True, is_train=True, epoch=epoch)
+        total_batches = len(train_loader)
+
+        # Milestone batches for 25%, 50%, 75%, 100% of epoch
+        milestones = {
+            max(1, int(0.25 * total_batches)): "25pct",
+            max(1, int(0.50 * total_batches)): "50pct",
+            max(1, int(0.75 * total_batches)): "75pct",
+            total_batches: "100pct"
+        }
+        log.print(f"\n--- Starting Epoch {epoch + 1}/{epochs} (Total Batches: {total_batches:,}) ---")
+        log.print(f"Milestones at batches: {milestones}")
+        log.print(f"Logging metrics every {Config.LOG_FREQ_BATCHES} batches to: {Config.TRAINING_RESULTS_TXT}")
+
         epoch_start_time = time()
         running_loss = 0.0
         running_ce = 0.0
@@ -114,26 +114,35 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, scaler,
         optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, (src_batch, tar_batch) in enumerate(pbar, start=1):
-            with autocast(dtype=Config.DTYPE):
+            with torch.amp.autocast('cuda', dtype=Config.DTYPE):
                 loss, ce_loss, aux_loss = calc_loss_batch(
                     model, src_batch, tar_batch, device,
                     aux_loss_coef=Config.AUX_LOSS_COEF,
                     label_smoothing=Config.LABEL_SMOOTHING
                 )
-                loss = loss / Config.GRAD_ACCUM_STEPS
+                if Config.GRAD_ACCUM_STEPS > 1:
+                    loss = loss / Config.GRAD_ACCUM_STEPS
 
-            scaler.scale(loss).backward()
+            if scaler and scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-            running_loss += loss.item() * Config.GRAD_ACCUM_STEPS
+            running_loss += loss.item() * (Config.GRAD_ACCUM_STEPS if Config.GRAD_ACCUM_STEPS > 1 else 1)
             running_ce += ce_loss.item()
             running_aux += aux_loss.item()
             batch_count += 1
 
             if batch_idx % Config.GRAD_ACCUM_STEPS == 0 or batch_idx == total_batches:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.MAX_GRAD_NORM)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler and scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.MAX_GRAD_NORM)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.MAX_GRAD_NORM)
+                    optimizer.step()
+
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler:
                     scheduler.step()
@@ -168,36 +177,33 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, scaler,
             if batch_idx in milestones:
                 pct_tag = milestones[batch_idx]
                 log.print(f"\n[Milestone reached: Epoch {epoch + 1} - {pct_tag} ({batch_idx}/{total_batches} batches)]")
-                
-                # Validation evaluation at milestone
-                val_loss, val_ce = calc_loss_loader(val_loader, model, device, num_batches=15, aux_loss_coef=Config.AUX_LOSS_COEF)
+
+                # Fast validation evaluation at milestone
+                val_loss, val_ce = calc_loss_loader(val_loader, model, device, num_batches=10, aux_loss_coef=Config.AUX_LOSS_COEF)
                 log.print(f"  Milestone Eval -> Val Loss: {val_loss:.4f} | Val CE: {val_ce:.4f}")
 
-                # Log milestone in text file
                 with open(Config.TRAINING_RESULTS_TXT, 'a', encoding='utf-8') as f:
                     f.write(f"--- MILESTONE: Epoch {epoch + 1} ({pct_tag}) | Val Loss: {val_loss:.4f} | Val CE: {val_ce:.4f} ---\n")
 
-                # 1. Save epoch milestone checkpoint
+                # Save milestone checkpoint
                 milestone_ckpt_path = os.path.join(
                     Config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}_{pct_tag}.pt"
                 )
-                # Next resume point is epoch if 100pct finished, else current epoch
                 save_epoch_idx = (epoch + 1) if pct_tag == "100pct" else epoch
                 save_checkpoint(milestone_ckpt_path, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
 
-                # 2. Check and save best model
+                # Check and save best model
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     save_checkpoint(Config.CHECKPOINT_BEST, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
                     log.print(f"  ★ NEW BEST MODEL SAVED! (Val loss: {best_val_loss:.4f})")
 
-                # 3. Update latest checkpoint
                 save_checkpoint(Config.CHECKPOINT_LATEST, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
                 model.train()
 
-            # Periodic logging
+            # Periodic validation and logging
             if step > 0 and step % eval_freq == 0 and batch_idx % Config.GRAD_ACCUM_STEPS == 0:
-                val_loss, val_ce = calc_loss_loader(val_loader, model, device, num_batches=10, aux_loss_coef=Config.AUX_LOSS_COEF)
+                val_loss, val_ce = calc_loss_loader(val_loader, model, device, num_batches=8, aux_loss_coef=Config.AUX_LOSS_COEF)
                 elapsed = time() - epoch_start_time
                 current_lr = optimizer.param_groups[0]['lr']
                 log.print(f"Step {step:07d} (Ep {epoch+1} {batch_idx}/{total_batches}) | Train: {running_loss/batch_count:.4f} | Val: {val_loss:.4f} | LR: {current_lr:.6f} | Time: {elapsed:.1f}s")
@@ -209,7 +215,6 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, scaler,
         log.print(f"Completed Epoch {epoch + 1}/{epochs} in {epoch_time:.2f}s | Avg Train Loss: {running_loss / batch_count:.4f}")
         log.print(f"=======================================================\n")
 
-        # Save 100% completion checkpoint and advance epoch index
         save_checkpoint(os.path.join(Config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}_100pct.pt"),
                         model, optimizer, scheduler, scaler, epoch + 1, step, best_val_loss, log)
         save_checkpoint(Config.CHECKPOINT_LATEST, model, optimizer, scheduler, scaler, epoch + 1, step, best_val_loss, log)
@@ -218,12 +223,11 @@ if __name__ == '__main__':
     train_path = f'{Config.PROCESSED_DATA_PATH}train_ids.parquet'
     val_path = f'{Config.PROCESSED_DATA_PATH}val_ids.parquet'
 
-    train_loader = get_dataloader(train_path, Config, shuffle=True, is_train=True)
     val_loader = get_dataloader(val_path, Config, shuffle=False, is_train=False)
 
     logger = Logger(Config.CHECKPOINT_LOG)
     logger.print("=" * 65)
-    logger.print("  150M MoE Transformer (5 Experts, Top-2 Routing) Training")
+    logger.print("  Accelerated 150M MoE Transformer (FlashAttention + Fused AdamW)")
     logger.print("=" * 65)
 
     model = TransformerModel(
@@ -244,17 +248,32 @@ if __name__ == '__main__':
 
     total_params, trainable_params = model.count_parameters()
     logger.print(f"Model Parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
-    logger.print(f"Trainable Parameters: {trainable_params:,}")
+    logger.print(f"Batch Size: {Config.BATCH_SIZE} | Precision: {Config.DTYPE}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=Config.LEARNING_RATE,
-        betas=(0.9, 0.98),
-        eps=1e-8,
-        weight_decay=Config.WEIGHT_DECAY
-    )
+    # Use fused AdamW on CUDA for significant GPU kernel speedup
+    use_fused = (Config.DEVICE == 'cuda')
+    try:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=Config.WEIGHT_DECAY,
+            fused=use_fused
+        )
+    except Exception:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=Config.WEIGHT_DECAY
+        )
 
-    total_steps = (len(train_loader) // Config.GRAD_ACCUM_STEPS) * max(1, Config.EPOCHS)
+    # Calculate steps based on configured samples per epoch
+    samples_per_epoch = Config.MAX_TRAIN_SAMPLES_PER_EPOCH or 2884451
+    batches_per_epoch = samples_per_epoch // Config.BATCH_SIZE
+    total_steps = (batches_per_epoch // Config.GRAD_ACCUM_STEPS) * max(1, Config.EPOCHS)
 
     # Cosine learning rate schedule with linear warmup
     def lr_lambda(current_step):
@@ -264,7 +283,9 @@ if __name__ == '__main__':
         return max(Config.MIN_LEARNING_RATE / Config.LEARNING_RATE, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler(enabled=(Config.DTYPE == torch.float16))
+    # Scaler only needed for FP16, not for native BF16
+    use_scaler = (Config.DTYPE == torch.float16 and Config.DEVICE == 'cuda')
+    scaler = GradScaler(enabled=use_scaler)
 
     start_step = 0
     start_epoch = 0
@@ -286,7 +307,7 @@ if __name__ == '__main__':
                 scheduler.load_state_dict(ckpt['scheduler_state_dict'])
             except Exception as e:
                 logger.print(f"Warning loading scheduler state: {e}")
-        if 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict']:
+        if 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict'] and use_scaler:
             try:
                 scaler.load_state_dict(ckpt['scaler_state_dict'])
             except Exception as e:
@@ -315,7 +336,7 @@ if __name__ == '__main__':
         logger.print(f"Training will run from Epoch {start_epoch + 1} to Epoch {Config.EPOCHS}...")
         train_model(
             model=model,
-            train_loader=train_loader,
+            train_path=train_path,
             val_loader=val_loader,
             optimizer=optimizer,
             scheduler=scheduler,

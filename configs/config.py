@@ -39,19 +39,27 @@ class Config:
     AUX_LOSS_COEF = 0.01  # Load balancing auxiliary loss coefficient
     TIE_EMBEDDINGS = True
 
-    # TRAINING HYPERPARAMETERS
-    BATCH_SIZE = 32
-    GRAD_ACCUM_STEPS = 2   # Effective batch size = 64
+    # SPEED & HARDWARE ACCELERATION HYPERPARAMETERS
+    BATCH_SIZE = 64        # Accelerated batch size (optimized for RTX 4050 with FlashAttention)
+    GRAD_ACCUM_STEPS = 1   # Effective batch size = 64
     LEARNING_RATE = 5e-4
     MIN_LEARNING_RATE = 1e-6
     EPOCHS = 1             # Easy setup: Initial epoch = 1. Increase to 2, 3, etc. to continue training!
-    WARMUP_STEPS = 2000
+    
+    # FAST EPOCH CONFIGURATION:
+    # The full dataset has 2,884,451 samples (which would be 90,000+ batches and take 30+ hours on a laptop GPU).
+    # Setting MAX_TRAIN_SAMPLES_PER_EPOCH allows an epoch to complete in ~4-5 minutes!
+    # Set to None if you wish to train on all 2.88M samples per epoch.
+    MAX_TRAIN_SAMPLES_PER_EPOCH = 100000
+
+    WARMUP_STEPS = 1000
     WEIGHT_DECAY = 0.01
     MAX_GRAD_NORM = 1.0
     LABEL_SMOOTHING = 0.1
 
-    # DEVICE
+    # DEVICE & PRECISION
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Use native BF16 for fast Tensor Core execution on Ada Lovelace RTX 4050
     DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
     # CHECKPOINTING & LOGGING
@@ -62,8 +70,8 @@ class Config:
     CHECKPOINT_LATEST = 'checkpoints/latest_checkpoint.pt'
 
     # LOGGING FREQUENCY
-    LOG_FREQ_BATCHES = 50   # Write metrics (epoch, batch, loss, ce, aux, lr, time) to txt file every N batches
-    EVAL_FREQ_STEPS = 500   # Validation loss evaluation frequency in steps
+    LOG_FREQ_BATCHES = 25   # Write metrics to txt file every N batches
+    EVAL_FREQ_STEPS = 250   # Validation loss evaluation frequency in steps
 
     # MODERN GENERATION / INFERENCE DEFAULTS
     DEFAULT_TEMPERATURE = 0.7

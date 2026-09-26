@@ -1,3 +1,5 @@
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import torch
 from torch.cuda.amp import autocast, GradScaler
 from time import time, strftime, localtime
@@ -285,7 +287,7 @@ if __name__ == '__main__':
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     # Scaler only needed for FP16, not for native BF16
     use_scaler = (Config.DTYPE == torch.float16 and Config.DEVICE == 'cuda')
-    scaler = GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_scaler)
 
     start_step = 0
     start_epoch = 0

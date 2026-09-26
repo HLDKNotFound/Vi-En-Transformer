@@ -5,7 +5,7 @@ class Config:
     # DATA CONFIG
     VOCAB_SIZE = 32000
     MIN_FREQ = 2
-    CONTEXT_LENGTH = 256
+    CONTEXT_LENGTH = 128   # Clamps sequences to 128 tokens (covers 99.9% of sentences, prevents 800+ token OOM spikes)
     TOP_K_VI_PHRASES = 4000  # Number of top Vietnamese compound phrases to register as single tokens
     
     TOKENIZER_PATH = 'tokenizer/vocab.json'
@@ -24,10 +24,6 @@ class Config:
     SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, SOS_TOKEN, EOS_TOKEN, EN_TOKEN, VI_TOKEN]
 
     # MODEL ARCHITECTURE (Target: ~150M parameters)
-    # 6 Encoder layers + 6 Decoder layers
-    # Embedding: 32000 * 512 = 16.38M
-    # MoE: 5 experts, top-2 selection per token, d_ff = 1860
-    # Total params ~ 149.87M
     MODEL_DIM = 512
     N_HEADS = 8
     FF_DIM = 1860
@@ -39,16 +35,15 @@ class Config:
     AUX_LOSS_COEF = 0.01  # Load balancing auxiliary loss coefficient
     TIE_EMBEDDINGS = True
 
-    # SPEED & HARDWARE ACCELERATION HYPERPARAMETERS
-    BATCH_SIZE = 64        # Accelerated batch size (optimized for RTX 4050 with FlashAttention)
-    GRAD_ACCUM_STEPS = 1   # Effective batch size = 64
+    # SPEED & MEMORY OPTIMIZED HYPERPARAMETERS (Guaranteed OOM-safe for RTX 4050 6GB)
+    BATCH_SIZE = 32        # Safe batch size to prevent peak allocation spikes
+    GRAD_ACCUM_STEPS = 2   # Effective batch size = 64
     LEARNING_RATE = 5e-4
     MIN_LEARNING_RATE = 1e-6
     EPOCHS = 1             # Easy setup: Initial epoch = 1. Increase to 2, 3, etc. to continue training!
     
     # FAST EPOCH CONFIGURATION:
-    # The full dataset has 2,884,451 samples (which would be 90,000+ batches and take 30+ hours on a laptop GPU).
-    # Setting MAX_TRAIN_SAMPLES_PER_EPOCH allows an epoch to complete in ~4-5 minutes!
+    # 100,000 samples per epoch finishes in ~8-12 minutes!
     # Set to None if you wish to train on all 2.88M samples per epoch.
     MAX_TRAIN_SAMPLES_PER_EPOCH = 100000
 

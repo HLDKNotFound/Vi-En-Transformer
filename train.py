@@ -177,6 +177,7 @@ def train_model(model, train_path, val_loader, optimizer, scheduler, scaler,
                 )
 
             # Checkpoint at 25%, 50%, 75%, and 100% of epoch
+            # Milestone evaluation at 25%, 50%, 75% (logging only, skip saving model)
             if batch_idx in milestones:
                 pct_tag = milestones[batch_idx]
                 log.print(f"\n[Milestone reached: Epoch {epoch + 1} - {pct_tag} ({batch_idx}/{total_batches} batches)]")
@@ -188,20 +189,13 @@ def train_model(model, train_path, val_loader, optimizer, scheduler, scaler,
                 with open(Config.TRAINING_RESULTS_TXT, 'a', encoding='utf-8') as f:
                     f.write(f"--- MILESTONE: Epoch {epoch + 1} ({pct_tag}) | Val Loss: {val_loss:.4f} | Val CE: {val_ce:.4f} ---\n")
 
-                # Save milestone checkpoint
-                milestone_ckpt_path = os.path.join(
-                    Config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}_{pct_tag}.pt"
-                )
-                save_epoch_idx = (epoch + 1) if pct_tag == "100pct" else epoch
-                save_checkpoint(milestone_ckpt_path, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
+                # Note: Skipping saving model checkpoints at 25%, 50%, 75% per user configuration to save disk space & I/O
+                if pct_tag == "100pct":
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_checkpoint(Config.CHECKPOINT_BEST, model, optimizer, scheduler, scaler, epoch + 1, step, best_val_loss, log)
+                        log.print(f"  ★ NEW BEST MODEL SAVED! (Val loss: {best_val_loss:.4f})")
 
-                # Check and save best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    save_checkpoint(Config.CHECKPOINT_BEST, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
-                    log.print(f"  ★ NEW BEST MODEL SAVED! (Val loss: {best_val_loss:.4f})")
-
-                save_checkpoint(Config.CHECKPOINT_LATEST, model, optimizer, scheduler, scaler, save_epoch_idx, step, best_val_loss, log)
                 model.train()
 
             # Periodic validation and logging
@@ -218,8 +212,9 @@ def train_model(model, train_path, val_loader, optimizer, scheduler, scaler,
         log.print(f"Completed Epoch {epoch + 1}/{epochs} in {epoch_time:.2f}s | Avg Train Loss: {running_loss / batch_count:.4f}")
         log.print(f"=======================================================\n")
 
-        save_checkpoint(os.path.join(Config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}_100pct.pt"),
-                        model, optimizer, scheduler, scaler, epoch + 1, step, best_val_loss, log)
+        # Save model checkpoint at end of epoch
+        epoch_ckpt_path = os.path.join(Config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}.pt")
+        save_checkpoint(epoch_ckpt_path, model, optimizer, scheduler, scaler, epoch + 1, step, best_val_loss, log)
         save_checkpoint(Config.CHECKPOINT_LATEST, model, optimizer, scheduler, scaler, epoch + 1, step, best_val_loss, log)
 
 if __name__ == '__main__':

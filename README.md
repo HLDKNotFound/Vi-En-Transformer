@@ -135,12 +135,12 @@ python train.py
    ```
    [2026-09-26 11:15:30] Epoch 1/1 | Batch 000050/090139 (  0.1%) | Step 0000025 | Loss: 10.2310 | CE_Loss: 10.0890 | MoE_Aux: 14.2010 | LR: 0.0000125 | Time: 18.2s
    ```
-2. **Milestone Checkpoints**: Automatically saved at:
-   - `checkpoints/model_epoch_1_25pct.pt`
-   - `checkpoints/model_epoch_1_50pct.pt`
-   - `checkpoints/model_epoch_1_75pct.pt`
-   - `checkpoints/model_epoch_1_100pct.pt`
-   - `checkpoints/best_model.pt` (saved whenever validation loss improves)
+2. **Checkpoint & Milestone Strategy**:
+   - **Progress Monitoring**: Validation loss and cross-entropy are evaluated and logged at **25%, 50%, 75%, and 100%** of each epoch to `checkpoints/training_results.txt`.
+   - **Disk-Optimized Model Saving**: To save disk space and I/O overhead (~5.4 GB saved per epoch), intermediate 25%, 50%, and 75% models are skipped. Full checkpoints are saved at:
+     - `checkpoints/model_epoch_{epoch}.pt` (at the completion of each epoch)
+     - `checkpoints/best_model.pt` (automatically updated whenever validation loss reaches a new best)
+     - `checkpoints/latest_checkpoint.pt` (for seamless training resumption)
 3. **Easy Epoch Configuration & Autoloading**:
    - `Config.EPOCHS` is set to `1` by default.
    - Once Epoch 1 finishes, simply open `configs/config.py` and set `EPOCHS = 2` (or `3`).

@@ -103,7 +103,8 @@ def train_model(model, train_path, val_loader, optimizer, scheduler, scaler,
             total_batches: "100pct"
         }
         log.print(f"\n--- Starting Epoch {epoch + 1}/{epochs} (Total Batches: {total_batches:,}) ---")
-        log.print(f"Milestones at batches: {milestones}")
+        active_weights = train_loader.dataset.task_weights
+        log.print(f"Task Weights: EN->VI: {active_weights[0]*100:.0f}%, VI->EN: {active_weights[1]*100:.0f}%, VI->VI: {active_weights[2]*100:.0f}%, EN->EN: {active_weights[3]*100:.0f}%")
         log.print(f"Logging metrics every {Config.LOG_FREQ_BATCHES} batches to: {Config.TRAINING_RESULTS_TXT}")
 
         epoch_start_time = time()

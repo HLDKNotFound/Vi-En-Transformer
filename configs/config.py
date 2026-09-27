@@ -40,8 +40,14 @@ class Config:
     GRAD_ACCUM_STEPS = 2   # Effective batch size = 64
     LEARNING_RATE = 5e-4
     MIN_LEARNING_RATE = 1e-6
-    EPOCHS = 1             # Easy setup: Initial epoch = 1. Increase to 2, 3, etc. to continue training!
+    EPOCHS = 2             # Easy setup: Initial epoch = 1. Increase to 2, 3, etc. to continue training!
     
+    # MULTI-TASK DATASET WEIGHTS (EN->VI, VI->EN, VI->VI, EN->EN)
+    # Stage 1 (Epochs 1-2): Warmup & multi-task representation learning
+    TASK_WEIGHTS_STAGE1 = (0.35, 0.35, 0.15, 0.15)
+    # Stage 2 (Epoch 3+): 90% Translation to eliminate copy shortcut & prioritize cross-lingual alignment
+    TASK_WEIGHTS_STAGE2 = (0.45, 0.45, 0.05, 0.05)
+
     # FAST EPOCH CONFIGURATION:
     # 100,000 samples per epoch finishes in ~8-12 minutes!
     # Set to None if you wish to train on all 2.88M samples per epoch.

@@ -93,16 +93,25 @@ def collate_fn(batch, pad_id=0):
 
     return src_padded, tar_padded
 
-def get_dataloader(file_path, config, shuffle=True, is_train=True, epoch=0):
+def get_dataloader(file_path, config, shuffle=True, is_train=True, epoch=0, task_weights=None):
     tok_path = config.TOKENIZER_JSON if os.path.exists(config.TOKENIZER_JSON) else config.TOKENIZER_PATH
     max_samples = config.MAX_TRAIN_SAMPLES_PER_EPOCH if is_train else None
+
+    if task_weights is None and is_train:
+        # Epoch is 0-indexed: epoch 0 = Ep 1, epoch 1 = Ep 2, epoch >= 2 = Ep 3+
+        if epoch >= 2:
+            task_weights = getattr(config, 'TASK_WEIGHTS_STAGE2', (0.45, 0.45, 0.05, 0.05))
+        else:
+            task_weights = getattr(config, 'TASK_WEIGHTS_STAGE1', (0.35, 0.35, 0.15, 0.15))
+
     dataset = MultiTaskTranslationDataset(
         file_path,
         tok_path,
         context_length=config.CONTEXT_LENGTH,
         is_train=is_train,
         max_samples=max_samples,
-        epoch_offset=epoch
+        epoch_offset=epoch,
+        task_weights=task_weights if task_weights is not None else (0.35, 0.35, 0.15, 0.15)
     )
     dataloader = DataLoader(
         dataset=dataset,

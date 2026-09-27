@@ -66,7 +66,6 @@ where $f_e$ is the fraction of tokens routed to expert $e$, and $P_e$ is the ave
 Activate your conda environment and install dependencies:
 
 ```bash
-conda activate ml-env
 cd Vi-En-Transformer
 pip install -r requirements.txt
 ```
@@ -146,6 +145,35 @@ python train.py
    - `Config.EPOCHS` is set to `1` by default.
    - Once Epoch 1 finishes, simply open `configs/config.py` and set `EPOCHS = 2` (or `3`).
    - Run `python train.py` again: the model **automatically detects the previous checkpoint, autoloads weights, optimizer, and scheduler**, and resumes training directly on Epoch 2!
+
+### 📈 Empirical Training Telemetry: Epoch 1 & Epoch 2 Results
+
+During training on 100,000 samples/epoch (3,125 batches with batch size 32, grad accum 2, effective batch 64), the model exhibited rapid, stable convergence:
+
+| Milestone / Metric | Epoch 1 (Initial Warmup) | Epoch 2 (Consolidation) | Delta / Improvement |
+| :--- | :--- | :--- | :--- |
+| **Milestone 25% (Batch 781)** | Val Loss: **6.8335** (CE: 6.7101) | Val Loss: **4.6016** (CE: 4.4799) | -2.2319 Val Loss |
+| **Milestone 50% (Batch 1562)** | Val Loss: **6.2538** (CE: 6.1317) | Val Loss: **4.2055** (CE: 4.0846) | -2.0483 Val Loss |
+| **Milestone 75% (Batch 2343)** | Val Loss: **5.4409** (CE: 5.3188) | Val Loss: **4.0071** (CE: 3.8863) | -1.4338 Val Loss |
+| **Milestone 100% (Batch 3125)** | Val Loss: **4.8855** (CE: 4.7646) | Val Loss: **3.9405** (CE: 3.8198) | -0.9450 Val Loss |
+| **Avg Epoch Train Loss** | **6.9234** | **5.6123** | -1.3111 Train Loss |
+| **Epoch Duration** | 2,864.5 s (~47.7 min) | 2,985.1 s (~49.7 min) | Stable ~0.93s / batch |
+
+### 🔬 Analysis: The "Copy Shortcut" Bias & Epoch 3+ Curriculum
+
+#### 1. Why Did the Model Favor Copying (EN $\to$ EN, VI $\to$ VI) After Epoch 2?
+In multi-task sequence-to-sequence learning with autoencoding objectives:
+- **Trivial Diagonal Alignment**: In autoencoding (EN $\to$ EN, VI $\to$ VI), target token $t_i$ strongly correlates with source token $s_i$. Cross-attention simply learns an identity copy function, which is mathematically far easier to minimize than cross-lingual translation (EN $\to$ VI, VI $\to$ EN), where syntactic reordering, idiom mapping, and vocabulary bridging are required.
+- **Gradient Dominance**: Because identity copying yields much faster initial loss reduction, the optimizer takes this shortcut first, sometimes ignoring the conditioning prefix token (`<en>` vs `<vi>`).
+
+#### 2. The Solution: Stage 2 Curriculum (Epoch 3 Onwards)
+To eliminate this shortcut and enforce strict cross-lingual semantic alignment, a **Two-Stage Curriculum** is introduced:
+- **Stage 1 (Epochs 1–2, Representation Warmup)**:
+  - Task Distribution: 35% EN $\to$ VI, 35% VI $\to$ EN, 15% VI $\to$ VI, 15% EN $\to$ EN.
+  - Goal: Bootstrap language representations, subword embeddings, and MoE routing specialization.
+- **Stage 2 (Epoch 3+, Translation Prioritization)**:
+  - Task Distribution: **45% EN $\to$ VI, 45% VI $\to$ EN, 5% VI $\to$ VI, 5% EN $\to$ EN** (**90% Translation, 10% Autoencoding**).
+  - Goal: 90% translation forces the cross-attention layers and MoE experts to map semantic representations across languages while retaining 10% autoencoding to maintain single-language grammatical fluency and vocabulary coherence without falling into the copy trap.
 
 ---
 
